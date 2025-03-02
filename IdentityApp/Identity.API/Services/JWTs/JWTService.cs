@@ -30,19 +30,19 @@ public class JWTService : IJWTService
     }
     public async Task<string> CreateJWT(User user)
     {
-        var userClaims = new List<Claim>
+        List<Claim> userClaims = new ()
         {
-            new Claim(ClaimTypes.NameIdentifier, user.Id),
-            new Claim(ClaimTypes.Email, user.UserName),
-            new Claim(ClaimTypes.GivenName, user.FirstName),
-            new Claim(ClaimTypes.Surname, user.LastName)
+            new (ClaimTypes.NameIdentifier, user.Id),
+            new (ClaimTypes.Email, user.UserName),
+            new (ClaimTypes.GivenName, user.FirstName),
+            new (ClaimTypes.Surname, user.LastName)
         };
 
-        var roles = await _userManager.GetRolesAsync(user);
+        IList<string> roles = await _userManager.GetRolesAsync(user);
         userClaims.AddRange(roles.Select(role => new Claim(ClaimTypes.Role, role)));
 
-        var creadentials = new SigningCredentials(_jwtKey, SecurityAlgorithms.HmacSha512Signature);
-        var tokenDescriptor = new SecurityTokenDescriptor
+        SigningCredentials creadentials = new SigningCredentials(_jwtKey, SecurityAlgorithms.HmacSha512Signature);
+        SecurityTokenDescriptor tokenDescriptor = new ()
         {
             Subject = new ClaimsIdentity(userClaims),
             Expires = DateTime.UtcNow.AddMinutes(int.Parse(_config["JWT:ExpiresInMinutes"])),
@@ -50,8 +50,8 @@ public class JWTService : IJWTService
             Issuer = _config["JWT:Issuer"]
         };
 
-        var tokenHandler = new JwtSecurityTokenHandler();
-        var jwt = tokenHandler.CreateToken(tokenDescriptor);
+        JwtSecurityTokenHandler tokenHandler = new ();
+        SecurityToken jwt = tokenHandler.CreateToken(tokenDescriptor);
         return tokenHandler.WriteToken(jwt);
     }
 
@@ -61,7 +61,7 @@ public class JWTService : IJWTService
         using var randomNumberGenerator = RandomNumberGenerator.Create();
         randomNumberGenerator.GetBytes(token);
 
-        var refreshToken = new RefreshToken()
+        RefreshToken refreshToken = new ()
         {
             Token = Convert.ToBase64String(token),
             User = user,
@@ -86,7 +86,7 @@ public class JWTService : IJWTService
     {
         RefreshToken refreshToken = CreateRefreshToken(user);
 
-        var existingRefreshToken = await _context.RefreshTokens.SingleOrDefaultAsync(x => x.UserId == user.Id);
+        RefreshToken? existingRefreshToken = await _context.RefreshTokens.SingleOrDefaultAsync(x => x.UserId == user.Id);
         if (existingRefreshToken is not null)
         {
             existingRefreshToken.Token = refreshToken.Token;
@@ -99,13 +99,6 @@ public class JWTService : IJWTService
         }
 
         await _context.SaveChangesAsync();
-
-        var cookieOptions = new CookieOptions
-        {
-            Expires = refreshToken.ExpiresAtUtc,
-            IsEssential = true,
-            HttpOnly = true,
-        };
 
         //Response.Cookies.Append("identityAppRefreshToken", refreshToken.Token, cookieOptions);
     }

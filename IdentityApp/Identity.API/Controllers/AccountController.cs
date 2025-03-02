@@ -1,9 +1,8 @@
 ﻿using System.Security.Claims;
 using System.Text;
-using Identity.API.Dtos;
 using Identity.API.Dtos.Account;
 using Identity.API.Entities;
-using Identity.API.Repo;
+using Identity.API.Exceptions;
 using Identity.API.Services.Accounts;
 using Identity.API.Services.JWTs;
 using Identity.API.Utils;
@@ -11,7 +10,7 @@ using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.WebUtilities;
-using Microsoft.EntityFrameworkCore;
+using SignInResult = Microsoft.AspNetCore.Identity.SignInResult;
 
 namespace Identity.API.Controllers;
 
@@ -21,7 +20,6 @@ public class AccountController : ControllerBase
 {
     private readonly SignInManager<User> _signInManager;
     private readonly UserManager<User> _userManager;
-    private readonly Context _context;
     private readonly HttpClient _facebookHttpClient;
     private readonly IConfiguration _config;
     private readonly IJWTService _jwtService;
@@ -30,14 +28,12 @@ public class AccountController : ControllerBase
     public AccountController(IJWTService jwtService,
         SignInManager<User> signInManager,
         UserManager<User> userManager,
-        Context context,
         IConfiguration config,
         IAccountService accountService)
     {
         _jwtService = jwtService;
         _signInManager = signInManager;
         _userManager = userManager;
-        _context = context;
         _config = config;
         _facebookHttpClient = new HttpClient
         {
@@ -60,47 +56,29 @@ public class AccountController : ControllerBase
     }
 
     [HttpPost("login")]
-    public async Task<ActionResult<UserDto>> Login(LoginDto model)
+    public async Task<ActionResult<UserDto>> Login(LoginDto login)
     {
-        var user = await _userManager.FindByNameAsync(model.UserName);
-        if (user == null) return Unauthorized("Invalid username or password");
-
-        if (user.EmailConfirmed == false) return Unauthorized("Please confirm your email.");
-
-        var result = await _signInManager.CheckPasswordSignInAsync(user, model.Password, false);
-
-        if (result.IsLockedOut)
+        try
         {
-            return Unauthorized(string.Format("Your account has been locked. You should wait until {0} (UTC time) to be able to login", user.LockoutEnd));
+            return Ok(await _accountService.Login(login));
         }
-
-        if (!result.Succeeded)
+        catch (LockedOutAccountException ex)
         {
-            // User has input an invalid password
-            if (!user.UserName.Equals(SD.AdminUserName))
-            {
-                await _userManager.AccessFailedAsync(user);
-            }
-
-            if (user.AccessFailedCount >= SD.MaximumLoginAttempts)
-            {
-                // Lock the user for one day
-                await _userManager.SetLockoutEndDateAsync(user, DateTime.UtcNow.AddDays(1));
-                return Unauthorized(string.Format("Your account has been locked. You should wait until {0} (UTC time) to be able to login", user.LockoutEnd));
-            }
-
-            return Unauthorized("Invalid username or password");
+            return Unauthorized(new { ex.Message, LockoutEnd = ex.UnlockDate });
         }
-
-        await _userManager.ResetAccessFailedCountAsync(user);
-        await _userManager.SetLockoutEndDateAsync(user, null);
-
-        return await _jwtService.CreateApplicationUserDto(user);
+        catch (MaximumLoginAttemptsException ex)
+        {
+            return Unauthorized(new { ex.Message, LockoutEnd = ex.UnlockDate });
+        }
+        catch (Exception ex)
+        {
+            return BadRequest(ex.Message);
+        }
     }
 
     [Authorize]
     [HttpPost("refresh-token")]
-    public async Task<ActionResult<UserDto>> RefereshToken()
+    public async Task<ActionResult<UserDto>> RefreshToken()
     {
         string? token = Request.Cookies["identityAppRefreshToken"];
         string? userId = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
@@ -109,7 +87,16 @@ public class AccountController : ControllerBase
 
         try
         {
-            return await _accountService.RefreshToken(token, userId);
+            (UserDto user, RefreshToken refreshToken) = await _accountService.RefreshToken(token, userId);
+            CookieOptions cookieOptions = new ()
+            {
+                Expires = refreshToken.ExpiresAtUtc,
+                IsEssential = true,
+                HttpOnly = true,
+            };
+
+            Response.Cookies.Append("identityAppRefreshToken", refreshToken.Token, cookieOptions);
+            return user;
         }
         catch (Exception ex)
         {
@@ -133,17 +120,17 @@ public class AccountController : ControllerBase
     [HttpPut("confirm-email")]
     public async Task<IActionResult> ConfirmEmail(ConfirmEmailDto model)
     {
-        var user = await _userManager.FindByEmailAsync(model.Email);
-        if (user == null) return Unauthorized("This email address has not been registered yet");
+        User? user = await _userManager.FindByEmailAsync(model.Email);
+        if (user is null) return Unauthorized("This email address has not been registered yet");
 
-        if (user.EmailConfirmed == true) return BadRequest("Your email was confirmed before. Please login to your account");
+        if (user.EmailConfirmed) return BadRequest("Your email was confirmed before. Please login to your account");
 
         try
         {
-            var decodedTokenBytes = WebEncoders.Base64UrlDecode(model.Token);
-            var decodedToken = Encoding.UTF8.GetString(decodedTokenBytes);
+            byte[] decodedTokenBytes = WebEncoders.Base64UrlDecode(model.Token);
+            string decodedToken = Encoding.UTF8.GetString(decodedTokenBytes);
 
-            var result = await _userManager.ConfirmEmailAsync(user, decodedToken);
+            IdentityResult result = await _userManager.ConfirmEmailAsync(user, decodedToken);
             if (result.Succeeded)
             {
                 return Ok(new JsonResult(new { title = "Email confirmed", message = "Your email address is confirmed. You can login now" }));
@@ -161,23 +148,49 @@ public class AccountController : ControllerBase
     public async Task<IActionResult> ResendEMailConfirmationLink(string email)
     {
         if (string.IsNullOrEmpty(email)) return BadRequest("Invalid email");
-        var user = await _userManager.FindByEmailAsync(email);
+        User? user = await _userManager.FindByEmailAsync(email);
 
-        if (user == null) return Unauthorized("This email address has not been registerd yet");
-        if (user.EmailConfirmed == true) return BadRequest("Your email address was confirmed before. Please login to your account");
+        if (user is null) return Unauthorized("This email address has not been registered yet");
+        if (user.EmailConfirmed) return BadRequest("Your email address was confirmed before. Please login to your account");
 
         try
         {
-            //if (await SendConfirmEMailAsync(user))
-            //{
-            //    return Ok(new JsonResult(new { title = "Confirmation link sent", message = "Please confirm your email address" }));
-            //}
+            if (await _accountService.SendConfirmEMailAsync(user))
+            {
+                return Ok(new JsonResult(new { title = "Confirmation link sent", message = "Please confirm your email address" }));
+            }
 
             return BadRequest("Failed to send email. PLease contact admin");
         }
         catch (Exception)
         {
             return BadRequest("Failed to send email. PLease contact admin");
+        }
+    }
+
+    [HttpPut("reset-password")]
+    public async Task<IActionResult> ResetPassword(ResetPasswordDto model)
+    {
+        User? user = await _userManager.FindByEmailAsync(model.Email);
+        if (user is null) return Unauthorized("This email address has not been registerd yet");
+        if (!user.EmailConfirmed) return BadRequest("PLease confirm your email address first");
+
+        try
+        {
+            byte[] decodedTokenBytes = WebEncoders.Base64UrlDecode(model.Token);
+            string decodedToken = Encoding.UTF8.GetString(decodedTokenBytes);
+
+            IdentityResult result = await _userManager.ResetPasswordAsync(user, decodedToken, model.NewPassword);
+            if (result.Succeeded)
+            {
+                return Ok(new JsonResult(new { title = "Password reset success", message = "Your password has been reset" }));
+            }
+
+            return BadRequest("Invalid token. Please try again");
+        }
+        catch (Exception)
+        {
+            return BadRequest("Invalid token. Please try again");
         }
     }
 
@@ -302,32 +315,6 @@ public class AccountController : ControllerBase
     //    }
     //}
 
-    [HttpPut("reset-password")]
-    public async Task<IActionResult> ResetPassword(ResetPasswordDto model)
-    {
-        var user = await _userManager.FindByEmailAsync(model.Email);
-        if (user is null) return Unauthorized("This email address has not been registerd yet");
-        if (user.EmailConfirmed == false) return BadRequest("PLease confirm your email address first");
-
-        try
-        {
-            var decodedTokenBytes = WebEncoders.Base64UrlDecode(model.Token);
-            var decodedToken = Encoding.UTF8.GetString(decodedTokenBytes);
-
-            var result = await _userManager.ResetPasswordAsync(user, decodedToken, model.NewPassword);
-            if (result.Succeeded)
-            {
-                return Ok(new JsonResult(new { title = "Password reset success", message = "Your password has been reset" }));
-            }
-
-            return BadRequest("Invalid token. Please try again");
-        }
-        catch (Exception)
-        {
-            return BadRequest("Invalid token. Please try again");
-        }
-    }
-
     //private async Task<bool> FacebookValidatedAsync(string accessToken, string userId)
     //{
     //    var facebookKeys = _config["Facebook:AppId"] + "|" + _config["Facebook:AppSecret"];
@@ -374,21 +361,4 @@ public class AccountController : ControllerBase
 
     //    return true;
     //}
-
-    public async Task<bool> IsValidRefreshTokenAsync(string userId, string token)
-    {
-        return await NewMethod(userId, token);
-    }
-
-    private async Task<bool> NewMethod(string userId, string token)
-    {
-        if (string.IsNullOrEmpty(userId) || string.IsNullOrEmpty(token)) return false;
-
-        var fetchedRefreshToken = await _context.RefreshTokens
-            .FirstOrDefaultAsync(x => x.UserId == userId && x.Token == token);
-        if (fetchedRefreshToken == null) return false;
-        if (fetchedRefreshToken.IsExpired) return false;
-
-        return true;
-    }
 }
