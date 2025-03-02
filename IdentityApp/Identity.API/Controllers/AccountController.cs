@@ -4,8 +4,8 @@ using Identity.API.Dtos;
 using Identity.API.Dtos.Account;
 using Identity.API.Entities;
 using Identity.API.Repo;
-using Identity.API.Services;
 using Identity.API.Services.Accounts;
+using Identity.API.Services.JWTs;
 using Identity.API.Utils;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Identity;
@@ -19,19 +19,17 @@ namespace Identity.API.Controllers;
 [ApiController]
 public class AccountController : ControllerBase
 {
-    private readonly JWTService _jwtService;
     private readonly SignInManager<User> _signInManager;
     private readonly UserManager<User> _userManager;
-    private readonly EmailService _emailService;
     private readonly Context _context;
-    private readonly IConfiguration _config;
     private readonly HttpClient _facebookHttpClient;
+    private readonly IConfiguration _config;
+    private readonly IJWTService _jwtService;
     private readonly IAccountService _accountService;
 
-    public AccountController(JWTService jwtService,
+    public AccountController(IJWTService jwtService,
         SignInManager<User> signInManager,
         UserManager<User> userManager,
-        EmailService emailService,
         Context context,
         IConfiguration config,
         IAccountService accountService)
@@ -39,7 +37,6 @@ public class AccountController : ControllerBase
         _jwtService = jwtService;
         _signInManager = signInManager;
         _userManager = userManager;
-        _emailService = emailService;
         _context = context;
         _config = config;
         _facebookHttpClient = new HttpClient
@@ -49,35 +46,17 @@ public class AccountController : ControllerBase
         _accountService = accountService;
     }
 
-    [Authorize]
-    [HttpPost("refresh-token")]
-    public async Task<ResponseDto<UserDto>> RefereshToken()
+    [HttpPost("register")]
+    public async Task<ActionResult<RegisterResultDto>> Register(RegisterDto register)
     {
-        string? token = Request.Cookies["identityAppRefreshToken"];
-        string? userId = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
-
         try
         {
-            UserDto user = await _accountService.RefereshToken(token, userId);
-            return new ResponseDto<UserDto> { Data = user, IsSuccess = true };
+            return Ok(await _accountService.Register(register));
         }
         catch (Exception ex)
         {
-            return new ResponseDto<UserDto> { IsSuccess = false, Message = ex.Message };
+            return BadRequest(ex.Message);
         }
-    }
-
-    [Authorize]
-    [HttpGet("refresh-page")]
-    public async Task<ActionResult<UserDto>> RefreshPage()
-    {
-        User? user = await _userManager.FindByNameAsync(User.FindFirst(ClaimTypes.Email)?.Value);
-
-        if (await _userManager.IsLockedOutAsync(user))
-        {
-            return Unauthorized("You have been locked out");
-        }
-        return await CreateApplicationUserDto(user);
     }
 
     [HttpPost("login")]
@@ -100,7 +79,6 @@ public class AccountController : ControllerBase
             // User has input an invalid password
             if (!user.UserName.Equals(SD.AdminUserName))
             {
-                // Increamenting AccessFailedCount of the AspNetUser by 1
                 await _userManager.AccessFailedAsync(user);
             }
 
@@ -111,14 +89,96 @@ public class AccountController : ControllerBase
                 return Unauthorized(string.Format("Your account has been locked. You should wait until {0} (UTC time) to be able to login", user.LockoutEnd));
             }
 
-
             return Unauthorized("Invalid username or password");
         }
 
         await _userManager.ResetAccessFailedCountAsync(user);
         await _userManager.SetLockoutEndDateAsync(user, null);
 
-        return await CreateApplicationUserDto(user);
+        return await _jwtService.CreateApplicationUserDto(user);
+    }
+
+    [Authorize]
+    [HttpPost("refresh-token")]
+    public async Task<ActionResult<UserDto>> RefereshToken()
+    {
+        string? token = Request.Cookies["identityAppRefreshToken"];
+        string? userId = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
+
+        if (token is null || userId is null) return BadRequest("bad parameters");
+
+        try
+        {
+            return await _accountService.RefreshToken(token, userId);
+        }
+        catch (Exception ex)
+        {
+            return BadRequest(ex.Message);
+        }
+    }
+
+    [Authorize]
+    [HttpGet("refresh-page")]
+    public async Task<ActionResult<UserDto>> RefreshPage()
+    {
+        User? user = await _userManager.FindByNameAsync(User.FindFirst(ClaimTypes.Email)?.Value);
+
+        if (await _userManager.IsLockedOutAsync(user))
+        {
+            return Unauthorized("You have been locked out");
+        }
+        return await _jwtService.CreateApplicationUserDto(user);
+    }
+
+    [HttpPut("confirm-email")]
+    public async Task<IActionResult> ConfirmEmail(ConfirmEmailDto model)
+    {
+        var user = await _userManager.FindByEmailAsync(model.Email);
+        if (user == null) return Unauthorized("This email address has not been registered yet");
+
+        if (user.EmailConfirmed == true) return BadRequest("Your email was confirmed before. Please login to your account");
+
+        try
+        {
+            var decodedTokenBytes = WebEncoders.Base64UrlDecode(model.Token);
+            var decodedToken = Encoding.UTF8.GetString(decodedTokenBytes);
+
+            var result = await _userManager.ConfirmEmailAsync(user, decodedToken);
+            if (result.Succeeded)
+            {
+                return Ok(new JsonResult(new { title = "Email confirmed", message = "Your email address is confirmed. You can login now" }));
+            }
+
+            return BadRequest("Invalid token. Please try again");
+        }
+        catch (Exception)
+        {
+            return BadRequest("Invalid token. Please try again");
+        }
+    }
+
+    [HttpPost("resend-email-confirmation-link/{email}")]
+    public async Task<IActionResult> ResendEMailConfirmationLink(string email)
+    {
+        if (string.IsNullOrEmpty(email)) return BadRequest("Invalid email");
+        var user = await _userManager.FindByEmailAsync(email);
+
+        if (user == null) return Unauthorized("This email address has not been registerd yet");
+        if (user.EmailConfirmed == true) return BadRequest("Your email address was confirmed before. Please login to your account");
+
+        try
+        {
+            //if (await SendConfirmEMailAsync(user))
+            //{
+            //    return Ok(new JsonResult(new { title = "Confirmation link sent", message = "Please confirm your email address" }));
+            //}
+
+            return BadRequest("Failed to send email. PLease contact admin");
+        }
+        catch (Exception)
+        {
+            return BadRequest("Failed to send email. PLease contact admin");
+        }
     }
 
     //[HttpPost("login-with-third-party")]
@@ -162,56 +222,6 @@ public class AccountController : ControllerBase
 
     //    return await CreateApplicationUserDto(user);
     //}
-
-    [HttpPost("register")]
-    public async Task<ResponseDto<RegisterResultDto>> Register(RegisterDto register)
-    {
-        if (await CheckEmailExistsAsync(register.Email))
-        {
-            return new ResponseDto<RegisterResultDto>
-            {
-                IsSuccess = false,
-                Message = $"An existing account is using {register.Email}, email address. Please try with another email address"
-            };
-        }
-
-        User userToAdd = register.ToUser();
-
-        IdentityResult result = await _userManager.CreateAsync(userToAdd, register.Password);
-        if (!result.Succeeded) return new ResponseDto<RegisterResultDto>
-        {
-            IsSuccess = false,
-            Message = string.Join(", ", result.Errors)
-        };
-        await _userManager.AddToRoleAsync(userToAdd, SD.PlayerRole);
-
-        try
-        {
-            //if (await SendConfirmEMailAsync(userToAdd))
-            //{
-            //    return new ResponseDto<RegisterResultDto>
-            //    {
-            //        Data = new RegisterResultDto { Title = "Account Created", Message = "Your account has been created, please confrim your email address" },
-            //        IsSuccess = true,
-            //        Message = "Your account has been created, please confrim your email address"
-            //    };
-            //}
-
-            return new ResponseDto<RegisterResultDto>
-            {
-                IsSuccess = false,
-                Message = "Failed to send email. Please contact admin"
-            };
-        }
-        catch (Exception ex)
-        {
-            return new ResponseDto<RegisterResultDto>
-            {
-                IsSuccess = false,
-                Message = ex.Message
-            };
-        }
-    }
 
     //[HttpPost("register-with-third-party")]
     //public async Task<ActionResult<UserDto>> RegisterWithThirdParty(RegisterWithExternal model)
@@ -267,57 +277,6 @@ public class AccountController : ControllerBase
     //    return await CreateApplicationUserDto(userToAdd);
     //}
 
-    [HttpPut("confirm-email")]
-    public async Task<IActionResult> ConfirmEmail(ConfirmEmailDto model)
-    {
-        var user = await _userManager.FindByEmailAsync(model.Email);
-        if (user == null) return Unauthorized("This email address has not been registered yet");
-
-        if (user.EmailConfirmed == true) return BadRequest("Your email was confirmed before. Please login to your account");
-
-        try
-        {
-            var decodedTokenBytes = WebEncoders.Base64UrlDecode(model.Token);
-            var decodedToken = Encoding.UTF8.GetString(decodedTokenBytes);
-
-            var result = await _userManager.ConfirmEmailAsync(user, decodedToken);
-            if (result.Succeeded)
-            {
-                return Ok(new JsonResult(new { title = "Email confirmed", message = "Your email address is confirmed. You can login now" }));
-            }
-
-            return BadRequest("Invalid token. Please try again");
-        }
-        catch (Exception)
-        {
-            return BadRequest("Invalid token. Please try again");
-        }
-    }
-
-    [HttpPost("resend-email-confirmation-link/{email}")]
-    public async Task<IActionResult> ResendEMailConfirmationLink(string email)
-    {
-        if (string.IsNullOrEmpty(email)) return BadRequest("Invalid email");
-        var user = await _userManager.FindByEmailAsync(email);
-
-        if (user == null) return Unauthorized("This email address has not been registerd yet");
-        if (user.EmailConfirmed == true) return BadRequest("Your email address was confirmed before. Please login to your account");
-
-        try
-        {
-            //if (await SendConfirmEMailAsync(user))
-            //{
-            //    return Ok(new JsonResult(new { title = "Confirmation link sent", message = "Please confirm your email address" }));
-            //}
-
-            return BadRequest("Failed to send email. PLease contact admin");
-        }
-        catch (Exception)
-        {
-            return BadRequest("Failed to send email. PLease contact admin");
-        }
-    }
-
     //[HttpPost("forgot-username-or-password/{email}")]
     //public async Task<IActionResult> ForgotUsernameOrPassword(string email)
     //{
@@ -369,69 +328,18 @@ public class AccountController : ControllerBase
         }
     }
 
-    private async Task<UserDto> CreateApplicationUserDto(User user)
-    {
-        await SaveRefreshTokenAsync(user);
-        return new UserDto
-        {
-            FirstName = user.FirstName,
-            LastName = user.LastName,
-            JWT = await _jwtService.CreateJWT(user),
-        };
-    }
-
-    private async Task<bool> CheckEmailExistsAsync(string email)
-    {
-        return await _userManager.Users.AnyAsync(x => x.Email == email.ToLower());
-    }
-
-    //private async Task<bool> SendConfirmEMailAsync(User user)
+    //private async Task<bool> FacebookValidatedAsync(string accessToken, string userId)
     //{
-    //    var token = await _userManager.GenerateEmailConfirmationTokenAsync(user);
-    //    token = WebEncoders.Base64UrlEncode(Encoding.UTF8.GetBytes(token));
-    //    var url = $"{_config["JWT:ClientUrl"]}/{_config["Email:ConfirmEmailPath"]}?token={token}&email={user.Email}";
+    //    var facebookKeys = _config["Facebook:AppId"] + "|" + _config["Facebook:AppSecret"];
+    //    var fbResult = await _facebookHttpClient.GetFromJsonAsync<FacebookResultDto>($"debug_token?input_token={accessToken}&access_token={facebookKeys}");
 
-    //    var body = $"<p>Hello: {user.FirstName} {user.LastName}</p>" +
-    //        "<p>Please confirm your email address by clicking on the following link.</p>" +
-    //        $"<p><a href=\"{url}\">Click here</a></p>" +
-    //        "<p>Thank you,</p>" +
-    //        $"<br>{_config["Email:ApplicationName"]}";
+    //    if (fbResult is null || fbResult.Data.Is_Valid == false || !fbResult.Data.User_Id.Equals(userId))
+    //    {
+    //        return false;
+    //    }
 
-    //    var emailSend = new EmailSendDto() { Body = body, Subject = "Confirm your email", To = user.Email };
-
-    //    return await _emailService.SendEmailAsync(emailSend);
+    //    return true;
     //}
-
-    //private async Task<bool> SendForgotUsernameOrPasswordEmail(User user)
-    //{
-    //    var token = await _userManager.GeneratePasswordResetTokenAsync(user);
-    //    token = WebEncoders.Base64UrlEncode(Encoding.UTF8.GetBytes(token));
-    //    var url = $"{_config["JWT:ClientUrl"]}/{_config["Email:ResetPasswordPath"]}?token={token}&email={user.Email}";
-
-    //    var body = $"<p>Hello: {user.FirstName} {user.LastName}</p>" +
-    //       $"<p>Username: {user.UserName}.</p>" +
-    //       "<p>In order to reset your password, please click on the following link.</p>" +
-    //       $"<p><a href=\"{url}\">Click here</a></p>" +
-    //       "<p>Thank you,</p>" +
-    //       $"<br>{_config["Email:ApplicationName"]}";
-
-    //    var emailSend = new EmailSendDto { To = user.Email, Subject = "Forgot username or password", Body = body };
-
-    //    return await _emailService.SendEmailAsync(emailSend);
-    //}
-
-    private async Task<bool> FacebookValidatedAsync(string accessToken, string userId)
-    {
-        var facebookKeys = _config["Facebook:AppId"] + "|" + _config["Facebook:AppSecret"];
-        var fbResult = await _facebookHttpClient.GetFromJsonAsync<FacebookResultDto>($"debug_token?input_token={accessToken}&access_token={facebookKeys}");
-
-        if (fbResult is null || fbResult.Data.Is_Valid == false || !fbResult.Data.User_Id.Equals(userId))
-        {
-            return false;
-        }
-
-        return true;
-    }
 
     //private async Task<bool> GoogleValidatedAsync(string accessToken, string userId)
     //{
@@ -466,34 +374,6 @@ public class AccountController : ControllerBase
 
     //    return true;
     //}
-
-    private async Task SaveRefreshTokenAsync(User user)
-    {
-        RefreshToken refreshToken = _jwtService.CreateRefreshToken(user);
-
-        var existingRefreshToken = await _context.RefreshTokens.SingleOrDefaultAsync(x => x.UserId == user.Id);
-        if (existingRefreshToken is not null)
-        {
-            existingRefreshToken.Token = refreshToken.Token;
-            existingRefreshToken.CreatedAtdUtc = refreshToken.CreatedAtdUtc;
-            existingRefreshToken.ExpiresAtUtc = refreshToken.ExpiresAtUtc;
-        }
-        else
-        {
-            user.RefreshTokens.Add(refreshToken);
-        }
-
-        await _context.SaveChangesAsync();
-
-        var cookieOptions = new CookieOptions
-        {
-            Expires = refreshToken.ExpiresAtUtc,
-            IsEssential = true,
-            HttpOnly = true,
-        };
-
-        Response.Cookies.Append("identityAppRefreshToken", refreshToken.Token, cookieOptions);
-    }
 
     public async Task<bool> IsValidRefreshTokenAsync(string userId, string token)
     {

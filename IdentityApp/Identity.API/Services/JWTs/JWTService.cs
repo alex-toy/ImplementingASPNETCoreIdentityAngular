@@ -1,26 +1,32 @@
-﻿using Identity.API.Entities;
+﻿using Azure;
+using Identity.API.Dtos.Account;
+using Identity.API.Entities;
+using Identity.API.Repo;
 using Microsoft.AspNetCore.Identity;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
 using System.IdentityModel.Tokens.Jwt;
 using System.Security.Claims;
 using System.Security.Cryptography;
 using System.Text;
 
-namespace Identity.API.Services;
+namespace Identity.API.Services.JWTs;
 
-public class JWTService
+public class JWTService : IJWTService
 {
     private readonly IConfiguration _config;
+    private readonly Context _context;
     private readonly UserManager<User> _userManager;
     private readonly SymmetricSecurityKey _jwtKey;
 
-    public JWTService(IConfiguration config, UserManager<User> userManager)
+    public JWTService(IConfiguration config, UserManager<User> userManager, Context context)
     {
         _config = config;
         _userManager = userManager;
 
         // jwtKey is used for both encripting and decripting the JWT token
         _jwtKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(_config["JWT:Key"]));
+        _context = context;
     }
     public async Task<string> CreateJWT(User user)
     {
@@ -63,5 +69,44 @@ public class JWTService
         };
 
         return refreshToken;
+    }
+
+    public async Task<UserDto> CreateApplicationUserDto(User user)
+    {
+        await SaveRefreshTokenAsync(user);
+        return new UserDto
+        {
+            FirstName = user.FirstName,
+            LastName = user.LastName,
+            JWT = await CreateJWT(user),
+        };
+    }
+
+    private async Task SaveRefreshTokenAsync(User user)
+    {
+        RefreshToken refreshToken = CreateRefreshToken(user);
+
+        var existingRefreshToken = await _context.RefreshTokens.SingleOrDefaultAsync(x => x.UserId == user.Id);
+        if (existingRefreshToken is not null)
+        {
+            existingRefreshToken.Token = refreshToken.Token;
+            existingRefreshToken.CreatedAtdUtc = refreshToken.CreatedAtdUtc;
+            existingRefreshToken.ExpiresAtUtc = refreshToken.ExpiresAtUtc;
+        }
+        else
+        {
+            user.RefreshTokens.Add(refreshToken);
+        }
+
+        await _context.SaveChangesAsync();
+
+        var cookieOptions = new CookieOptions
+        {
+            Expires = refreshToken.ExpiresAtUtc,
+            IsEssential = true,
+            HttpOnly = true,
+        };
+
+        //Response.Cookies.Append("identityAppRefreshToken", refreshToken.Token, cookieOptions);
     }
 }
